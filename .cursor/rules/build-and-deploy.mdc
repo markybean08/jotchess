@@ -1,0 +1,26 @@
+---
+description: Every Android build must bump version by 0.1 and copy the APK to the LAN SMB share.
+alwaysApply: true
+---
+
+# Build, version, and network deploy
+
+Whenever you produce a debug (or release) APK for this project:
+
+1. **Bump version before building** (one step per build)
+   - In [`app/build.gradle.kts`](app/build.gradle.kts): increase `versionCode` by `1`, then set `versionName` from it (`114` → `1.14`).
+   - Example: `1.13` / `113` → `1.14` / `114` (minor digit +1; user shorthand “+0.1” on the minor).
+
+2. **Build**
+   - Prefer `./scripts/build-and-deploy.sh` (bumps, builds, copies).
+   - Or: `./gradlew assembleDebug` after the bump.
+
+3. **Copy APK to the network share when possible**
+   - SMB share: `smb://192.168.2.10/download/`
+   - Prefer a **versioned filename**: `app-debug-<versionName>.apk` (e.g. `app-debug-1.14.apk`).
+   - Also write/overwrite `app-debug.apk` as the latest pointer when the share is reachable.
+   - If the share is unreachable, report that clearly; do not fail the whole task if git commit/push still succeeded.
+
+4. **Commit the version bump** with the build-related changes (unless the user asked not to commit).
+
+Do not skip the version bump on agent-driven builds.

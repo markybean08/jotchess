@@ -19,10 +19,23 @@ yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
 
 ## Build
 
+Every build **bumps the version one step** (`1.13`→`1.14`, `versionCode` +1) and copies the APK to the LAN share when reachable.
+
 ```bash
+# Preferred: bump + assemble + copy to smb://192.168.2.10/download/
+./scripts/build-and-deploy.sh
+
+# Or manually after bumping app/build.gradle.kts:
 ./gradlew assembleDebug
 # APK: app/build/outputs/apk/debug/app-debug.apk
 ```
+
+Network deploy (when `smb://192.168.2.10/download/` is mounted, usually at `/Volumes/download`):
+
+- `app-debug-<versionName>.apk` — versioned copy (preferred)
+- `app-debug.apk` — latest pointer (overwritten)
+
+Agent/CI instruction: see [`.cursor/rules/build-and-deploy.mdc`](.cursor/rules/build-and-deploy.mdc).
 
 ## Install & run
 
