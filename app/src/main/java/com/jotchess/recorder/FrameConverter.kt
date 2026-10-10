@@ -12,10 +12,12 @@ import org.opencv.imgproc.Imgproc
 
 /**
  * Converts CameraX YUV analysis frames into upright OpenCV RGB Mats / Bitmaps.
+ * Front-camera frames are horizontally mirrored so tap/calibration coords match
+ * what the user sees (selfie preview convention) without flipping board logic.
  */
 object FrameConverter {
 
-    fun imageProxyToRgbMat(image: ImageProxy): Mat {
+    fun imageProxyToRgbMat(image: ImageProxy, mirrorHorizontal: Boolean = false): Mat {
         require(image.format == ImageFormat.YUV_420_888) {
             "Expected YUV_420_888, got ${image.format}"
         }
@@ -45,9 +47,18 @@ object FrameConverter {
             bgr.release()
         }
 
+        val oriented = if (mirrorHorizontal) {
+            val flipped = Mat()
+            Core.flip(upright, flipped, 1) // 1 = horizontal flip
+            upright.release()
+            flipped
+        } else {
+            upright
+        }
+
         val rgb = Mat()
-        Imgproc.cvtColor(upright, rgb, Imgproc.COLOR_BGR2RGB)
-        upright.release()
+        Imgproc.cvtColor(oriented, rgb, Imgproc.COLOR_BGR2RGB)
+        oriented.release()
         return rgb
     }
 

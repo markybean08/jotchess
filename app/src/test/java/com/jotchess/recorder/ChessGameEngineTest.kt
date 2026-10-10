@@ -87,6 +87,21 @@ class ChessGameEngineTest {
         val pgn = engine.pgn()
         assertTrue(pgn.contains("1. e4 e5"))
         assertTrue(pgn.contains("[Result \"*\"]"))
+        assertTrue(pgn.trimEnd().endsWith("*"))
+        assertEquals("*", engine.resultTag())
+    }
+
+    @Test
+    fun resultTag_checkmateIsOneZero() {
+        // Fool's mate: 1.f3 e5 2.g4 Qh4#
+        engine.commit(Move(Square.F2, Square.F3))
+        engine.commit(Move(Square.E7, Square.E5))
+        engine.commit(Move(Square.G2, Square.G4))
+        engine.commit(Move(Square.D8, Square.H4))
+        assertEquals("0-1", engine.resultTag())
+        val pgn = engine.pgn()
+        assertTrue(pgn.contains("[Result \"0-1\"]"))
+        assertTrue(pgn.trimEnd().endsWith("0-1"))
     }
 
     @Test

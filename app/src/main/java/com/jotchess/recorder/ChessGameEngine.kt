@@ -31,6 +31,18 @@ class ChessGameEngine {
     val movesSan: List<String> get() = sanHistory.toList()
     val moveCount: Int get() = sanHistory.size
     val sideToMove: Side get() = board.sideToMove
+    val lastSan: String? get() = sanHistory.lastOrNull()
+
+    /**
+     * Auto result: mate → 1-0 / 0-1, draw/stalemate → 1/2-1/2, else unfinished *.
+     */
+    fun resultTag(): String {
+        return when {
+            board.isMated -> if (board.sideToMove == Side.WHITE) "0-1" else "1-0"
+            board.isDraw || board.isStaleMate -> "1/2-1/2"
+            else -> "*"
+        }
+    }
 
     fun reset() {
         loadFen(START_FEN)
@@ -114,6 +126,7 @@ class ChessGameEngine {
         white: String = "White",
         black: String = "Black",
         event: String = "JotChess Recording",
+        result: String = resultTag(),
     ): String {
         val date = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy.MM.dd"))
         val headers = buildString {
@@ -123,7 +136,7 @@ class ChessGameEngine {
             appendLine("[Round \"1\"]")
             appendLine("[White \"$white\"]")
             appendLine("[Black \"$black\"]")
-            appendLine("[Result \"*\"]")
+            appendLine("[Result \"$result\"]")
             appendLine()
         }
         val body = buildString {
@@ -134,7 +147,7 @@ class ChessGameEngine {
                 append(san)
                 append(' ')
             }
-            append('*')
+            append(result)
         }
         return headers + body.trim()
     }
