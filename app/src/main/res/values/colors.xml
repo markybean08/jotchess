@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#121212</color>
+    <color name="pitch_anthracite">#121212</color>
+    <color name="surface_container">#1E1E1E</color>
+    <color name="carbon_mint">#00FFC2</color>
+    <color name="hot_synth_pink">#FF2079</color>
+    <color name="acid_yellow">#DFFF00</color>
+</resources>
