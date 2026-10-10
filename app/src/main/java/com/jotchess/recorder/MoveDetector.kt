@@ -1,12 +1,8 @@
 package com.jotchess.recorder
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -17,9 +13,17 @@ data class DetectorConfig(
     val motionThreshold: Double = 6.0,
     val settleMs: Long = 500L,
     val anomalyMs: Long = 3000L,
-    val squareDiffThreshold: Double = 12.0,
+    /** Join the changed set above this Lab mean delta. */
+    val squareJoinThreshold: Double = 12.0,
+    /** Leave the changed set only below this Lab mean delta. */
+    val squareLeaveThreshold: Double = 8.0,
     val lightingBlend: Double = 0.02,
     val motionScale: Size = Size(100.0, 100.0),
+    /** Sensor-time gap treated as board / camera motion. */
+    val maxFrameGapMs: Long = 200L,
+    /** Identical changed-square sets required before evaluating a move. */
+    val stableFrameCount: Int = 3,
+    val maxReferenceHistory: Int = 200,
 )
 
 sealed class DetectorState {
@@ -34,12 +38,44 @@ sealed class DetectorState {
 }
 
 /**
- * Difference mapping, hand/motion gate, 3-second knocked-piece debounce.
+ * Per-square hysteresis latch: join above [join], leave only below [leave].
+ * Pure helper so unit tests need no OpenCV.
+ */
+class SquareChangeLatch(
+    private val join: Double = 12.0,
+    private val leave: Double = 8.0,
+) {
+    private val latched = mutableSetOf<String>()
+
+    fun update(scores: Map<String, Double>): Set<String> {
+        for ((square, score) in scores) {
+            if (score > join) {
+                latched += square
+            } else if (score < leave) {
+                latched -= square
+            }
+        }
+        // Drop squares that disappeared from this frame's score map.
+        latched.retainAll(scores.keys)
+        return latched.toSet()
+    }
+
+    fun clear() {
+        latched.clear()
+    }
+
+    fun snapshot(): Set<String> = latched.toSet()
+}
+
+/**
+ * Difference mapping, hand/motion gate, sensor-clock anomaly debounce.
+ *
+ * All public methods MUST run on the analysisExecutor thread that owns
+ * [referenceLab] and the undo history. Never release Mats from the UI thread.
  */
 class MoveDetector(
     private val calibrator: BoardCalibrator,
     private val engine: ChessGameEngine,
-    private val scope: CoroutineScope,
     private val config: DetectorConfig = DetectorConfig(),
     private val onMoveCommitted: (san: String, uci: String) -> Unit = { _, _ -> },
 ) {
@@ -51,8 +87,19 @@ class MoveDetector(
 
     private var previousSmall: Mat? = null
     private var referenceLab: Mat? = null
+    /** Cloned referenceLab mats prior to each committed move (oldest first). */
+    private val referenceHistory = ArrayDeque<Mat>()
+    private val squareLatch = SquareChangeLatch(
+        join = config.squareJoinThreshold,
+        leave = config.squareLeaveThreshold,
+    )
+
     private var stillSinceMs: Long? = null
-    private var anomalyJob: Job? = null
+    private var lastFrameMs: Long? = null
+    private var stableChanged: Set<String>? = null
+    private var stableCount: Int = 0
+    private var anomalyDeadlineMs: Long? = null
+    private var anomalySquares: Set<String>? = null
     private var enabled: Boolean = false
 
     fun start() {
@@ -62,39 +109,96 @@ class MoveDetector(
 
     fun stop() {
         enabled = false
-        cancelAnomaly()
+        clearAnomaly()
+        stillSinceMs = null
+        lastFrameMs = null
+        resetStability()
         _state.value = DetectorState.Idle
     }
 
     fun resetReference(warpedRgb: Mat) {
-        referenceLab?.release()
-        referenceLab = toLab(warpedRgb)
-        cancelAnomaly()
+        replaceReference(toLab(warpedRgb))
+        clearAnomaly()
+        resetStability()
         _changedSquares.value = emptySet()
         _state.value = DetectorState.Settled
     }
 
-    fun onGameReset(warpedRgb: Mat?) {
-        cancelAnomaly()
+    /**
+     * Soft reset after Undo / Reset Game: drop live reference so the next
+     * settled frame becomes the new baseline. Undo restores history separately.
+     */
+    fun clearLiveReference() {
+        clearAnomaly()
+        resetStability()
+        squareLatch.clear()
         _changedSquares.value = emptySet()
-        if (warpedRgb != null) {
-            resetReference(warpedRgb)
-        } else {
-            referenceLab?.release()
-            referenceLab = null
-            _state.value = DetectorState.Idle
-        }
+        referenceLab?.release()
+        referenceLab = null
+        _state.value = DetectorState.Idle
+    }
+
+    fun onGameReset() {
+        clearReferenceHistory()
+        clearLiveReference()
     }
 
     /**
-     * Process one warped 400x400 RGB frame. Call only when calibration is ready.
+     * Restore the reference that was active before the last committed move.
+     * Call on the analysis thread together with [ChessGameEngine.undoLast].
      */
-    fun processFrame(warpedRgb: Mat, nowMs: Long = System.currentTimeMillis()) {
+    fun undoReference(): Boolean {
+        val prior = referenceHistory.removeLastOrNull() ?: return false
+        clearAnomaly()
+        resetStability()
+        squareLatch.clear()
+        _changedSquares.value = emptySet()
+        referenceLab?.release()
+        referenceLab = prior
+        _state.value = DetectorState.Settled
+        return true
+    }
+
+    /**
+     * Drop live reference after a 180° flip so the next settle recaptures Lab.
+     */
+    fun invalidateReferenceKeepHistory() {
+        clearAnomaly()
+        resetStability()
+        squareLatch.clear()
+        _changedSquares.value = emptySet()
+        referenceLab?.release()
+        referenceLab = null
+        _state.value = DetectorState.Idle
+    }
+
+    /**
+     * Process one warped 400x400 RGB frame.
+     * [nowMs] must be derived from ImageProxy sensor timestamps (ns → ms).
+     */
+    fun processFrame(warpedRgb: Mat, nowMs: Long) {
         if (!enabled) return
+
+        val prevTs = lastFrameMs
+        lastFrameMs = nowMs
+        if (prevTs != null) {
+            val gap = nowMs - prevTs
+            if (gap > config.maxFrameGapMs) {
+                // Pause: treat as motion and push anomaly deadline forward.
+                stillSinceMs = null
+                resetStability()
+                anomalyDeadlineMs?.let { anomalyDeadlineMs = it + gap }
+                if (_state.value !is DetectorState.Anomaly && _state.value !is DetectorState.Flagged) {
+                    _state.value = DetectorState.Moving
+                }
+                return
+            }
+        }
 
         val moving = isHandMoving(warpedRgb)
         if (moving) {
             stillSinceMs = null
+            resetStability()
             if (_state.value !is DetectorState.Anomaly && _state.value !is DetectorState.Flagged) {
                 _state.value = DetectorState.Moving
             }
@@ -107,6 +211,7 @@ class MoveDetector(
         }
 
         if (settledFor < config.settleMs) {
+            resetStability()
             if (_state.value !is DetectorState.Anomaly && _state.value !is DetectorState.Flagged) {
                 _state.value = DetectorState.Moving
             }
@@ -122,29 +227,35 @@ class MoveDetector(
         val changed = detectChangedSquares(warpedRgb, ref)
         _changedSquares.value = changed
 
+        if (!isStable(changed)) {
+            if (_state.value !is DetectorState.Anomaly && _state.value !is DetectorState.Flagged) {
+                _state.value = DetectorState.Moving
+            }
+            return
+        }
+
         when (val current = _state.value) {
             is DetectorState.Flagged -> {
                 if (changed.isEmpty()) {
-                    // Board restored to expected occupancy.
-                    cancelAnomaly()
+                    clearAnomaly()
                     blendReference(warpedRgb)
                     _state.value = DetectorState.Settled
                 } else {
-                    tryCommitOrKeep(changed, flagged = true)
+                    tryCommitOrKeep(changed, flagged = true, warpedRgb)
                 }
             }
 
             is DetectorState.Anomaly -> {
+                val deadline = anomalyDeadlineMs ?: current.deadlineMs
                 if (changed.isEmpty()) {
-                    // Knocked piece stood back up — discard silently.
-                    cancelAnomaly()
+                    clearAnomaly()
                     blendReference(warpedRgb)
                     _state.value = DetectorState.Settled
-                } else if (changed != current.squares) {
-                    // Pattern shifted; restart debounce with new squares.
+                } else if (changed != (anomalySquares ?: current.squares)) {
                     startAnomaly(changed, nowMs)
+                } else if (nowMs >= deadline) {
+                    resolveAnomaly(changed, warpedRgb)
                 }
-                // Else: wait for timer.
             }
 
             else -> {
@@ -154,7 +265,6 @@ class MoveDetector(
                 } else {
                     val match = engine.matchMove(changed)
                     if (match.move != null && match.san != null && match.uci != null && !match.ambiguous) {
-                        // Fast path: legal move commits immediately after settle.
                         commitMove(match.move, match.san, match.uci, warpedRgb)
                     } else {
                         startAnomaly(changed, nowMs)
@@ -168,65 +278,72 @@ class MoveDetector(
         stop()
         previousSmall?.release()
         previousSmall = null
+        clearReferenceHistory()
         referenceLab?.release()
         referenceLab = null
+        squareLatch.clear()
     }
 
-    private fun tryCommitOrKeep(changed: Set<String>, flagged: Boolean) {
+    private fun tryCommitOrKeep(changed: Set<String>, flagged: Boolean, warpedRgb: Mat) {
         val match = engine.matchMove(changed)
         if (match.move != null && match.san != null && match.uci != null && !match.ambiguous) {
-            // Need current warped frame for reference — caller path with Flagged
-            // will get reference refresh on next settled empty/commit via processFrame.
-            // Commit without warped mat: mark for reference refresh on next frame.
-            engine.commit(match.move)
-            onMoveCommitted(match.san, match.uci)
-            cancelAnomaly()
-            referenceLab?.release()
-            referenceLab = null
-            _changedSquares.value = emptySet()
-            _state.value = DetectorState.Settled
+            commitMove(match.move, match.san, match.uci, warpedRgb)
         } else if (!flagged) {
             _state.value = DetectorState.Flagged(changed)
         }
     }
 
-    private fun commitMove(move: com.github.bhlangonijr.chesslib.move.Move, san: String, uci: String, warpedRgb: Mat) {
+    private fun commitMove(
+        move: com.github.bhlangonijr.chesslib.move.Move,
+        san: String,
+        uci: String,
+        warpedRgb: Mat,
+    ) {
+        // Snapshot pre-move reference for undo before adopting the new board.
+        pushReferenceHistory()
         engine.commit(move)
         onMoveCommitted(san, uci)
-        cancelAnomaly()
-        resetReference(warpedRgb)
+        clearAnomaly()
+        replaceReference(toLab(warpedRgb))
+        resetStability()
         _changedSquares.value = emptySet()
         _state.value = DetectorState.Settled
     }
 
     private fun startAnomaly(squares: Set<String>, nowMs: Long) {
-        cancelAnomaly()
-        val deadline = nowMs + config.anomalyMs
-        _state.value = DetectorState.Anomaly(squares, deadline)
-        anomalyJob = scope.launch {
-            delay(config.anomalyMs)
-            val pending = _changedSquares.value
-            if (pending.isEmpty()) {
-                _state.value = DetectorState.Settled
-                return@launch
-            }
-            val match = engine.matchMove(pending)
-            if (match.move != null && match.san != null && match.uci != null && !match.ambiguous) {
-                engine.commit(match.move)
-                onMoveCommitted(match.san, match.uci)
-                referenceLab?.release()
-                referenceLab = null
-                _changedSquares.value = emptySet()
-                _state.value = DetectorState.Settled
-            } else {
-                _state.value = DetectorState.Flagged(pending)
-            }
+        anomalySquares = squares
+        anomalyDeadlineMs = nowMs + config.anomalyMs
+        _state.value = DetectorState.Anomaly(squares, anomalyDeadlineMs!!)
+    }
+
+    private fun resolveAnomaly(changed: Set<String>, warpedRgb: Mat) {
+        val match = engine.matchMove(changed)
+        if (match.move != null && match.san != null && match.uci != null && !match.ambiguous) {
+            commitMove(match.move, match.san, match.uci, warpedRgb)
+        } else {
+            clearAnomaly()
+            _state.value = DetectorState.Flagged(changed)
         }
     }
 
-    private fun cancelAnomaly() {
-        anomalyJob?.cancel()
-        anomalyJob = null
+    private fun clearAnomaly() {
+        anomalyDeadlineMs = null
+        anomalySquares = null
+    }
+
+    private fun isStable(changed: Set<String>): Boolean {
+        if (stableChanged == changed) {
+            stableCount++
+        } else {
+            stableChanged = changed
+            stableCount = 1
+        }
+        return stableCount >= config.stableFrameCount
+    }
+
+    private fun resetStability() {
+        stableChanged = null
+        stableCount = 0
     }
 
     private fun isHandMoving(warpedRgb: Mat): Boolean {
@@ -252,7 +369,7 @@ class MoveDetector(
 
     private fun detectChangedSquares(warpedRgb: Mat, referenceLab: Mat): Set<String> {
         val currentLab = toLab(warpedRgb)
-        val changed = mutableSetOf<String>()
+        val scores = LinkedHashMap<String, Double>(64)
         for (file in 'a'..'h') {
             for (rank in 1..8) {
                 val square = "$file$rank"
@@ -266,21 +383,38 @@ class MoveDetector(
                 diff.release()
                 a.release()
                 b.release()
-                if (score >= config.squareDiffThreshold) {
-                    changed += square
-                }
+                scores[square] = score
             }
         }
         currentLab.release()
-        return changed
+        return squareLatch.update(scores)
     }
 
     private fun blendReference(warpedRgb: Mat) {
         val ref = referenceLab ?: return
         val current = toLab(warpedRgb)
-        // ref = ref*(1-a) + current*a
         Core.addWeighted(ref, 1.0 - config.lightingBlend, current, config.lightingBlend, 0.0, ref)
         current.release()
+    }
+
+    private fun replaceReference(newLab: Mat) {
+        referenceLab?.release()
+        referenceLab = newLab
+        squareLatch.clear()
+    }
+
+    private fun pushReferenceHistory() {
+        val ref = referenceLab ?: return
+        referenceHistory.addLast(ref.clone())
+        while (referenceHistory.size > config.maxReferenceHistory) {
+            referenceHistory.removeFirst().release()
+        }
+    }
+
+    private fun clearReferenceHistory() {
+        while (referenceHistory.isNotEmpty()) {
+            referenceHistory.removeFirst().release()
+        }
     }
 
     private fun toLab(rgb: Mat): Mat {

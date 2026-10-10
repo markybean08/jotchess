@@ -16,6 +16,12 @@ import androidx.activity.viewModels
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -72,6 +78,10 @@ import com.jotchess.recorder.ui.theme.SurfaceContainer
 import com.jotchess.recorder.ui.theme.TextPrimary
 import com.jotchess.recorder.ui.theme.TextSecondary
 import java.util.concurrent.TimeUnit
+
+/** Build identity shown in the UI so sideloaded APKs are easy to verify. */
+private val APP_VERSION_LABEL =
+    "V${BuildConfig.VERSION_NAME}  ·  BUILD ${BuildConfig.VERSION_CODE}"
 
 /**
  * Compose UI + CameraX ImageAnalysis integration.
@@ -265,12 +275,31 @@ private fun RecorderScreen(
             .fillMaxSize()
             .padding(16.dp),
     ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "JOTCHESS",
+                style = MaterialTheme.typography.headlineMedium,
+                color = TextPrimary,
+                fontWeight = FontWeight.Black,
+                letterSpacing = 0.5.sp,
+            )
+            NeubrutalistChip(
+                text = "V${BuildConfig.VERSION_NAME}",
+                containerColor = AcidYellow,
+                contentColor = HardBlack,
+            )
+        }
         Text(
-            text = "JOTCHESS",
-            style = MaterialTheme.typography.headlineMedium,
-            color = TextPrimary,
-            fontWeight = FontWeight.Black,
+            text = APP_VERSION_LABEL,
+            color = TextSecondary,
+            fontWeight = FontWeight.Bold,
             letterSpacing = 0.5.sp,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 2.dp),
         )
         Text(
             text = ui.statusText.uppercase(),
@@ -278,8 +307,33 @@ private fun RecorderScreen(
             fontWeight = FontWeight.Bold,
             letterSpacing = 0.5.sp,
             fontSize = 12.sp,
-            modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
+            modifier = Modifier.padding(top = 4.dp, bottom = 8.dp),
         )
+
+        // Always-visible camera toggle (not buried in the scrolled action row).
+        if (!ui.gameFinished) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                NeubrutalistButton(
+                    text = if (ui.useFrontCamera) "Cam: Front" else "Cam: Back",
+                    onClick = { viewModel.toggleCameraLens() },
+                    containerColor = if (ui.useFrontCamera) CarbonMint else SurfaceContainer,
+                    contentColor = if (ui.useFrontCamera) HardBlack else TextPrimary,
+                )
+                Text(
+                    text = if (ui.useFrontCamera) "USING FRONT LENS" else "USING BACK LENS",
+                    color = TextSecondary,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 0.5.sp,
+                    fontSize = 11.sp,
+                )
+            }
+        }
 
         if (ui.gameFinished) {
             FinishedPanel(
@@ -296,9 +350,11 @@ private fun RecorderScreen(
             BoardPreview(
                 bitmap = ui.previewBitmap,
                 calibrating = ui.calibrating,
+                calibrationPhase = ui.calibrationPhase,
                 highlightSquares = ui.highlightSquares,
                 detectorState = ui.detectorState,
                 cornerPoints = ui.cornerPoints,
+                scanQuad = ui.scanQuad,
                 onTap = { nx, ny, w, h -> viewModel.onBoardTapped(nx, ny, w, h) },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -307,7 +363,12 @@ private fun RecorderScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            StatusBadge(ui.detectorState, ui.calibrating, ui.recording)
+            StatusBadge(
+                state = ui.detectorState,
+                calibrating = ui.calibrating,
+                recording = ui.recording,
+                phase = ui.calibrationPhase,
+            )
 
             Spacer(Modifier.height(10.dp))
 
@@ -317,14 +378,23 @@ private fun RecorderScreen(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                NeubrutalistButton(
-                    text = if (ui.useFrontCamera) "Cam: Front" else "Cam: Back",
-                    onClick = { viewModel.toggleCameraLens() },
-                    containerColor = SurfaceContainer,
-                    contentColor = TextPrimary,
-                )
-
                 if (ui.calibrating) {
+                    if (ui.calibrationPhase == CalibrationPhase.AUTO_SCANNING && ui.showManualFallback) {
+                        NeubrutalistButton(
+                            text = "Tap Manually",
+                            onClick = { viewModel.enableManualCalibration() },
+                            containerColor = HotSynthPink,
+                            contentColor = HardBlack,
+                        )
+                    }
+                    if (ui.calibrationPhase == CalibrationPhase.MANUAL) {
+                        NeubrutalistButton(
+                            text = "Auto Scan",
+                            onClick = { viewModel.enableAutoScan() },
+                            containerColor = AcidYellow,
+                            contentColor = HardBlack,
+                        )
+                    }
                     NeubrutalistButton(
                         text = "Rotate (${ui.rotation}°)",
                         onClick = { viewModel.cycleRotation() },
@@ -332,10 +402,20 @@ private fun RecorderScreen(
                         containerColor = SurfaceContainer,
                         contentColor = TextPrimary,
                     )
+                    if (ui.orientationAmbiguous || ui.cornerCount == 4) {
+                        NeubrutalistButton(
+                            text = "Flip 180°",
+                            onClick = { viewModel.flip180() },
+                            enabled = ui.cornerCount == 4,
+                            containerColor = if (ui.orientationAmbiguous) AcidYellow else SurfaceContainer,
+                            contentColor = HardBlack.takeIf { ui.orientationAmbiguous } ?: TextPrimary,
+                        )
+                    }
                     NeubrutalistButton(
                         text = "Record Game",
                         onClick = { viewModel.confirmCalibration() },
-                        enabled = ui.cornerCount == 4,
+                        enabled = ui.cornerCount == 4 ||
+                            ui.calibrationPhase == CalibrationPhase.CALIBRATED,
                         containerColor = CarbonMint,
                         contentColor = HardBlack,
                         disabledContainerColor = CarbonMint.copy(alpha = 0.45f),
@@ -377,6 +457,12 @@ private fun RecorderScreen(
                         onClick = { viewModel.undo() },
                         containerColor = SurfaceContainer,
                         contentColor = TextPrimary,
+                    )
+                    NeubrutalistButton(
+                        text = "Flip 180°",
+                        onClick = { viewModel.flip180() },
+                        containerColor = if (ui.orientationAmbiguous) AcidYellow else SurfaceContainer,
+                        contentColor = HardBlack.takeIf { ui.orientationAmbiguous } ?: TextPrimary,
                     )
                     NeubrutalistButton(
                         text = "Recalibrate",
@@ -541,9 +627,16 @@ private fun MoveListBody(moves: List<String>) {
 }
 
 @Composable
-private fun StatusBadge(state: DetectorState, calibrating: Boolean, recording: Boolean) {
+private fun StatusBadge(
+    state: DetectorState,
+    calibrating: Boolean,
+    recording: Boolean,
+    phase: CalibrationPhase,
+) {
     val label = when {
-        calibrating -> "CALIBRATING"
+        calibrating && phase == CalibrationPhase.AUTO_SCANNING -> "AUTO-SCANNING BOARD..."
+        calibrating && phase == CalibrationPhase.CALIBRATED -> "CALIBRATED"
+        calibrating && phase == CalibrationPhase.MANUAL -> "TAP 4 CORNERS"
         recording && state is DetectorState.Moving -> "MOVING"
         recording && state is DetectorState.Settled -> "SETTLED"
         recording && state is DetectorState.Anomaly -> "TIMER 3S"
@@ -552,6 +645,8 @@ private fun StatusBadge(state: DetectorState, calibrating: Boolean, recording: B
         else -> "READY"
     }
     val fill = when {
+        calibrating && phase == CalibrationPhase.AUTO_SCANNING -> AcidYellow
+        calibrating && phase == CalibrationPhase.CALIBRATED -> CarbonMint
         calibrating -> HotSynthPink
         state is DetectorState.Settled -> AcidYellow
         state is DetectorState.Flagged -> HotSynthPink
@@ -571,9 +666,11 @@ private fun StatusBadge(state: DetectorState, calibrating: Boolean, recording: B
 private fun BoardPreview(
     bitmap: Bitmap?,
     calibrating: Boolean,
+    calibrationPhase: CalibrationPhase,
     highlightSquares: Set<String>,
     detectorState: DetectorState,
     cornerPoints: List<CornerPoint>,
+    scanQuad: List<CornerPoint>,
     onTap: (normalizedX: Float, normalizedY: Float, imageWidth: Int, imageHeight: Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -583,6 +680,7 @@ private fun BoardPreview(
         is DetectorState.Anomaly -> HotSynthPink.copy(alpha = 0.55f)
         else -> HotSynthPink.copy(alpha = 0.40f)
     }
+    val pulse = rememberInfinitePulseAlpha()
 
     NeubrutalistCard(
         modifier = modifier,
@@ -598,9 +696,11 @@ private fun BoardPreview(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .pointerInput(calibrating, bitmap.width, bitmap.height) {
+                        .pointerInput(calibrating, calibrationPhase, bitmap.width, bitmap.height) {
                             detectTapGestures { offset ->
-                                if (!calibrating) return@detectTapGestures
+                                if (!calibrating || calibrationPhase != CalibrationPhase.MANUAL) {
+                                    return@detectTapGestures
+                                }
                                 val bw = bitmap.width.toFloat()
                                 val bh = bitmap.height.toFloat()
                                 val scale = minOf(size.width / bw, size.height / bh)
@@ -630,14 +730,17 @@ private fun BoardPreview(
                         val left = (size.width - dw) / 2f
                         val top = (size.height - dh) / 2f
 
-                        drawRect(
-                            color = AcidYellow,
-                            topLeft = Offset(left, top),
-                            size = Size(dw, dh),
-                            style = Stroke(width = 3.dp.toPx()),
-                        )
+                        fun mapPoint(p: CornerPoint): Offset {
+                            return Offset(left + p.x / bw * dw, top + p.y / bh * dh)
+                        }
 
                         if (!calibrating) {
+                            drawRect(
+                                color = AcidYellow,
+                                topLeft = Offset(left, top),
+                                size = Size(dw, dh),
+                                style = Stroke(width = 3.dp.toPx()),
+                            )
                             val cell = dw / 8f
                             for (i in 0..8) {
                                 val x = left + i * cell
@@ -669,42 +772,66 @@ private fun BoardPreview(
                                 )
                             }
                         } else {
-                            cornerPoints.forEachIndexed { index, p ->
-                                val cx = left + p.x / bw * dw
-                                val cy = top + p.y / bh * dh
-                                val r = 14.dp.toPx()
-                                val arm = 10.dp.toPx()
-                                val stroke = 3.dp.toPx()
+                            // Auto-scan / calibrated mint bounding quad
+                            val quad = when {
+                                scanQuad.size == 4 -> scanQuad
+                                cornerPoints.size == 4 &&
+                                    calibrationPhase == CalibrationPhase.CALIBRATED -> cornerPoints
+                                else -> emptyList()
+                            }
+                            if (quad.size == 4) {
+                                val mapped = quad.map { mapPoint(it) }
+                                val stroke = 4.dp.toPx()
+                                val mint = CarbonMint.copy(alpha = pulse)
+                                for (i in 0 until 4) {
+                                    drawLine(
+                                        color = mint,
+                                        start = mapped[i],
+                                        end = mapped[(i + 1) % 4],
+                                        strokeWidth = stroke,
+                                    )
+                                }
+                            }
 
-                                drawCircle(
-                                    color = AcidYellow,
-                                    radius = r,
-                                    center = Offset(cx, cy),
-                                    style = Stroke(width = stroke),
-                                )
-                                drawCircle(
-                                    color = HotSynthPink,
-                                    radius = r * 0.45f,
-                                    center = Offset(cx, cy),
-                                )
-                                drawLine(
-                                    color = AcidYellow,
-                                    start = Offset(cx - arm, cy),
-                                    end = Offset(cx + arm, cy),
-                                    strokeWidth = stroke,
-                                )
-                                drawLine(
-                                    color = AcidYellow,
-                                    start = Offset(cx, cy - arm),
-                                    end = Offset(cx, cy + arm),
-                                    strokeWidth = stroke,
-                                )
-                                if (index == 0) {
+                            // Manual tap targets
+                            if (calibrationPhase == CalibrationPhase.MANUAL) {
+                                cornerPoints.forEachIndexed { index, p ->
+                                    val cx = mapPoint(p).x
+                                    val cy = mapPoint(p).y
+                                    val r = 14.dp.toPx()
+                                    val arm = 10.dp.toPx()
+                                    val stroke = 3.dp.toPx()
+
                                     drawCircle(
-                                        color = HardBlack,
-                                        radius = 3.dp.toPx(),
+                                        color = AcidYellow,
+                                        radius = r,
+                                        center = Offset(cx, cy),
+                                        style = Stroke(width = stroke),
+                                    )
+                                    drawCircle(
+                                        color = HotSynthPink,
+                                        radius = r * 0.45f,
                                         center = Offset(cx, cy),
                                     )
+                                    drawLine(
+                                        color = AcidYellow,
+                                        start = Offset(cx - arm, cy),
+                                        end = Offset(cx + arm, cy),
+                                        strokeWidth = stroke,
+                                    )
+                                    drawLine(
+                                        color = AcidYellow,
+                                        start = Offset(cx, cy - arm),
+                                        end = Offset(cx, cy + arm),
+                                        strokeWidth = stroke,
+                                    )
+                                    if (index == 0) {
+                                        drawCircle(
+                                            color = HardBlack,
+                                            radius = 3.dp.toPx(),
+                                            center = Offset(cx, cy),
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -712,10 +839,11 @@ private fun BoardPreview(
                 }
             } else {
                 Text(
-                    text = if (!calibrating) {
-                        "WAITING FOR CAMERA…"
-                    } else {
-                        "GRANT CAMERA PERMISSION AND TAP 4 CORNERS"
+                    text = when {
+                        !calibrating -> "WAITING FOR CAMERA…"
+                        calibrationPhase == CalibrationPhase.AUTO_SCANNING ->
+                            "POINT CAMERA AT THE BOARD…"
+                        else -> "GRANT CAMERA PERMISSION AND TAP 4 CORNERS"
                     },
                     color = TextSecondary,
                     fontWeight = FontWeight.Bold,
@@ -725,4 +853,22 @@ private fun BoardPreview(
             }
         }
     }
+}
+
+@Composable
+private fun rememberInfinitePulseAlpha(): Float {
+    val transition = rememberInfiniteTransition(label = "pulse")
+    val alpha by transition.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(
+                durationMillis = 700,
+                easing = FastOutSlowInEasing,
+            ),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "pulseAlpha",
+    )
+    return alpha
 }
